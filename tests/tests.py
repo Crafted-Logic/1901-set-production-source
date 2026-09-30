@@ -10,7 +10,8 @@ def row(id_, hd="APPROVE", rsp="", p="simple", extra="2"):
 def sheet(**kw): return Sheet(list(HDR), [row("1901-001", hd="", extra=""), row("1901-002", hd="REVISE"), row("1901-003", **kw)])
 def drive(): return Drive({FID: {"name": "1901-003-redraw-c-stamp.png", "mime_type": "image/png"}})
 RES_OK = {"result": "RESOLVED", "resolved_file": {"drive_file_id": FID, "name": "1901-003-redraw-c-stamp.png", "url": canonical(FID), "mime_type": "image/png"}}
-AUTH = {"evidence": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."}
+AUTH = "AUTHORIZE SOURCE WRITE 1901-003"   # the only authorizing message
+ASK = "Set the production source for 1901-003."
 
 examples = {}
 def T(n, name, out, result, wrote, sh, dr, extra_ok=None):
@@ -33,7 +34,7 @@ def only_one_cell(o, sh):
     assert o["verification"]["post_write_verified"] is True and o["after"]["render_source_path"] == canonical(FID)
 T(1, "approved+verified+authorized", o, "UPDATED", True, sh, dr, only_one_cell)
 # 2 no authorization
-sh, dr = sheet(), drive(); T(2, "no authorization", run("1901-003", sh, dr, RES_OK, None), "AWAITING_AUTHORIZATION", False, sh, dr)
+sh, dr = sheet(), drive(); T(2, "no authorization", run("1901-003", sh, dr, RES_OK, ASK), "AWAITING_AUTHORIZATION", False, sh, dr)
 # 3 resolver not RESOLVED
 sh, dr = sheet(), drive(); T(3, "resolver AMBIGUOUS", run("1901-003", sh, dr, {"result": "AMBIGUOUS", "human_action_required": "Jody or Ame: record which of the listed files is the approved artwork for this design, then re-run."}, AUTH), "SOURCE_NOT_RESOLVED", False, sh, dr)
 # 4 blank human_decision
@@ -67,6 +68,39 @@ T(12, "post-write reread", o, "UPDATED", True, sh, dr, reread)
 # 13 failed post-write verification: exactly one write, no retry
 sh, dr = sheet(), drive(); sh.fail_next_write = True; o = run("1901-003", sh, dr, RES_OK, AUTH)
 T(13, "failed verification, no retry", o, "WRITE_FAILED", True, sh, dr, lambda o, sh: (len(sh.writes) == 1 and o["verification"]["post_write_verified"] is False) or sys.exit("retry!"))
+# --- authorization-safety cases (v1.1)
+def no_write(n, name, msg, result="AWAITING_AUTHORIZATION"):
+    sh, dr = sheet(), drive(); T(n, name, run("1901-003", sh, dr, RES_OK, msg), result, False, sh, dr)
+no_write("A1", "'Set the production source for 1901-003.'", ASK)
+no_write("A2", "'Prepare the production source for 1901-003.'", "Prepare the production source for 1901-003.")
+no_write("A3", "'Proceed.'", "Proceed.")
+no_write("A4", "'Do it.'", "Do it.")
+no_write("A5", "'Looks good.'", "Looks good.")
+no_write("A6", "'Use the resolved source for 1901-003.'", "Use the resolved source for 1901-003.")
+no_write("A7", "AUTHORIZE WRITE 1901-003", "AUTHORIZE WRITE 1901-003")
+no_write("A8", "AUTHORIZE SOURCE 1901-003", "AUTHORIZE SOURCE 1901-003")
+no_write("A9", "AUTHORIZE SOURCE WRITE (no id)", "AUTHORIZE SOURCE WRITE")
+no_write("A10", "wrong id while operating on 1901-003", "AUTHORIZE SOURCE WRITE 1901-004")
+no_write("A11", "'Yes, authorize it'", "Yes, authorize it")
+no_write("A12", "prose around the command", "Please AUTHORIZE SOURCE WRITE 1901-003 now")
+sh, dr = sheet(), drive(); o = run("1901-003", sh, dr, RES_OK, "  AUTHORIZE SOURCE WRITE 1901-003  ")
+T("A13", "command with surrounding whitespace", o, "UPDATED", True, sh, dr, lambda o, sh: (o["authorization"]["evidence"] == "AUTHORIZE SOURCE WRITE 1901-003" and len(sh.writes) == 1) or sys.exit("ws"))
+sh, dr = sheet(), drive(); o = run("1901-003", sh, dr, RES_OK, "authorize source write 1901-003")
+T("A14", "lower-case command", o, "UPDATED", True, sh, dr, lambda o, sh: len(sh.writes) == 1 or sys.exit("lc"))
+# A15 prior authorization does not carry: run 1 authorized but blocked (REVISE); row fixed; run 2 'Proceed.' → no write
+sh, dr = sheet(hd="REVISE"), drive(); o1 = run("1901-003", sh, dr, RES_OK, AUTH); assert o1["result"] == "HUMAN_APPROVAL_REQUIRED" and sh.writes == []
+sh.rows[2][16] = "APPROVE"; T("A15", "prior-run authorization does not carry", run("1901-003", sh, dr, RES_OK, "Proceed."), "AWAITING_AUTHORIZATION", False, sh, dr)
+# A16 failed verification: no retry in-run, and a later 'Proceed.' does not write; a fresh command is required
+sh, dr = sheet(), drive(); sh.fail_next_write = True; o1 = run("1901-003", sh, dr, RES_OK, AUTH); assert o1["result"] == "WRITE_FAILED" and len(sh.writes) == 1
+o2 = run("1901-003", sh, dr, RES_OK, "Proceed."); assert o2["result"] == "AWAITING_AUTHORIZATION" and len(sh.writes) == 1, "retry without fresh command"
+o3 = run("1901-003", sh, dr, RES_OK, AUTH); assert o3["result"] == "UPDATED" and len(sh.writes) == 2
+print("A16. PASS failed verification: no automatic retry; 'Proceed.' did not write; fresh command wrote once")
+# A17 authorized write changes no other field (full-row diff against snapshot)
+sh, dr = sheet(), drive(); snap2 = copy.deepcopy(sh.rows); o = run("1901-003", sh, dr, RES_OK, AUTH)
+assert o["result"] == "UPDATED" and all(v == snap2[i][j] for i, r in enumerate(sh.rows) for j, v in enumerate(r) if (i, j) != (2, 18))
+print("A17. PASS authorized write changed only S4")
+examples["C"] = run("1901-003", sheet(), drive(), RES_OK, "AUTHORIZE SOURCE WRITE 1901-004")
+examples["D"] = run("1901-003", sheet(), drive(), RES_OK, "Proceed.")
 # 14/15: no Drive / Printify / Etsy mutation — asserted in every T() via dr.mutations; ref.py has no such calls
 import inspect, re as _re
 src = inspect.getsource(sys.modules["ref"])
@@ -81,5 +115,5 @@ sh, dr = sheet(), Drive({}); T(19, "file gone", run("1901-003", sh, dr, RES_OK, 
 sh, dr = sheet(rsp=canonical(FID) + "?usp=sharing"), drive(); T(20, "same file, non-canonical existing", run("1901-003", sh, dr, RES_OK, AUTH), "SOURCE_ALREADY_SET_CONFLICT", False, sh, dr)
 print("ALL PASS")
 if "--dump" in sys.argv:
-  for n in (1, 2, 4, 3, 7, 8, 13, 9):
+  for n in (1, 2, "C", "D", 4, 3, 7, 8, 13, 9):
       open(f"ex{n}.json", "w").write(json.dumps(examples[n], indent=1, ensure_ascii=False) + "\n")

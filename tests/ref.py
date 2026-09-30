@@ -53,9 +53,23 @@ class Drive:
         if not self.readable: return "UNAVAILABLE"
         return self.files.get(fid)
 
-def run(design_id, sheet, drive, resolver, authorization=None, proposed_value=None):
-    """resolver: dict as 1901-resolve-production-source would return. authorization: None or
-    {'evidence': str}. proposed_value: a value the user asked to write, if any."""
+COMMAND_WORDS = ("AUTHORIZE", "SOURCE", "WRITE")
+
+def authorization_command(message, design_id):
+    """Return the exact command text if `message` is the authorization command for `design_id`,
+    the id it names if it is the command for a different id, else None. Trim surrounding
+    whitespace; the three words compare case-insensitively; the id must equal the target exactly."""
+    if not isinstance(message, str): return None
+    parts = message.strip().split()
+    if len(parts) != 4 or tuple(w.upper() for w in parts[:3]) != COMMAND_WORDS: return None
+    return ("OK", message.strip()) if parts[3] == design_id else ("OTHER_ID", parts[3])
+
+def run(design_id, sheet, drive, resolver, message="", proposed_value=None):
+    """resolver: dict as 1901-resolve-production-source would return. message: the user's text in
+    the CURRENT run (the only place authorization can come from). proposed_value: a value the
+    user asked to write, if any."""
+    auth = authorization_command(message, design_id)
+    authorization = {"evidence": auth[1]} if auth and auth[0] == "OK" else None
     out={"design_id":"", "result":"", "write_performed":False, "timestamp":TS,
          "source":{"spreadsheet_id":SPREADSHEET,"sheet_name":SHEET,"sheet_id":GID,"row_number":None},
          "before":{"render_source_path":None}, "after":{"render_source_path":None},
@@ -156,9 +170,12 @@ def run(design_id, sheet, drive, resolver, authorization=None, proposed_value=No
 
     # 7 authorization
     if not authorization:
-        chk("authorization","FAIL","no explicit authorization for this specific render_source_path write in the current conversation")
-        return done("AWAITING_AUTHORIZATION",f"To proceed, explicitly authorize writing render_source_path = {target} for {did} (for example: \"Authorize the render_source_path update for {did}.\"). Nothing has been written.")
-    chk("authorization","PASS",authorization["evidence"])
+        if auth and auth[0] == "OTHER_ID":
+            chk("authorization","FAIL",f"the command names {auth[1]}, not the target {did}; it authorizes nothing in this run")
+        else:
+            chk("authorization","FAIL","the current run does not contain the exact command AUTHORIZE SOURCE WRITE "+did+"; ordinary requests and vague confirmations never authorize a write")
+        return done("AWAITING_AUTHORIZATION",f"No write performed. Row {row} is eligible: render_source_path would be set to {target}. To authorize exactly this write, send exactly: AUTHORIZE SOURCE WRITE {did}")
+    chk("authorization","PASS",f"current run contains the exact command: {authorization['evidence']}")
 
     # 8 write: exactly one cell
     ok=sheet.write_cell(row,"render_source_path",target)

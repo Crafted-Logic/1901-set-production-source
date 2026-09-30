@@ -15,28 +15,43 @@ Core rule: **VERIFY, DON'T ASSUME.** This skill does not discover artwork and
 does not choose artwork. It records a decision that was already made and
 already verified by evidence read in the current run: the live queue row says
 the human approved the design, `1901-resolve-production-source` resolved
-exactly one file, Drive confirms that file exists, and the user explicitly
-authorised this specific write. If any of that is missing, it writes nothing
-and says why.
+exactly one file, Drive confirms that file exists, and the current run
+contains the exact authorization command for this design. If any of that is
+missing, it writes nothing and says why.
 
 ## When to Use
 
 Trigger on requests such as:
 
-- "Set the resolved source for 1901-003."
-- "Write the verified production source for 1901-003."
-- "Authorize the render_source_path update for 1901-003."
+- "Set the production source for 1901-003."
+- "Prepare the production source for 1901-003."
+- "Show me the production source for 1901-003."
 - "Record the production source for <design_id>."
+- `AUTHORIZE SOURCE WRITE 1901-003`
+
+The skill has two steps, and every ordinary request is step 1 only.
+
+- **Step 1, proposal.** Any request to inspect, prepare, set up, resolve,
+  show, propose, set, fix, update, or use the production source runs every
+  read-only check and, when the row is eligible, returns
+  `AWAITING_AUTHORIZATION` with `write_performed = false`, naming the exact
+  canonical URL that would be written and the exact command that would
+  authorise it. It mutates nothing.
+- **Step 2, authorised write.** Only a run whose user message is exactly
+  `AUTHORIZE SOURCE WRITE <design_id>` (see Authorization) may write, and
+  only after every live check is re-run from scratch in that run and still
+  passes.
 
 Expected flow inside Walter: queue read → resolve production source → human
-approval → **set production source** → validate readiness. This skill is the
-fourth step only. Do not use it to find a file (`1901-resolve-production-source`),
+approval → **set production source** (step 1, then step 2) → validate
+readiness. Do not use it to find a file (`1901-resolve-production-source`),
 to read a row alone (`1901-read-idea-queue`), or to judge readiness
 (`1901-validate-readiness`).
 
-Vague instructions such as "set the source", "update the source", "fix the
-row", "looks good", "proceed", "do it", or "sounds good" never cause a write
-on their own. They may start the checks; they do not satisfy authorisation.
+"Set the production source for 1901-003", "fix the source", "update the
+source", "use the resolved source", "looks good", "proceed", "do it", and
+"sounds good" never cause a write. They may start the checks; they never
+satisfy authorisation.
 
 ## Authoritative Sheet
 
@@ -79,9 +94,44 @@ render images; change or infer human approval; choose between candidate source
 files; resolve documentation conflicts; write to an audit table (audit logging
 is designed separately; this skill carries its audit data in its response).
 
+## Authorization
+
+The only user-authored text that authorises the write is the exact command:
+
+```
+AUTHORIZE SOURCE WRITE <design_id>
+```
+
+for example `AUTHORIZE SOURCE WRITE 1901-003`. Rules:
+
+- Exact structure: the three words, then the design id, nothing else. Trim
+  surrounding whitespace; the three words compare case-insensitively
+  (`authorize source write 1901-003` authorises). Prose around the command,
+  a missing id, a reordered or shortened phrase, or any other wording does
+  not authorise.
+- The id must equal the target design id exactly. `AUTHORIZE SOURCE WRITE
+  1901-004` while working on `1901-003` authorises nothing: not `1901-003`,
+  and not `1901-004` either. Say so in `checks` and return
+  `AWAITING_AUTHORIZATION` for the target.
+- The command must appear in the **current run**. Authorization from an
+  earlier turn or run, a remembered "yes", or the fact that the user just
+  asked to set the source is not authorisation. The command is consumed by
+  the run that receives it and never becomes standing permission.
+- A run that receives the command still runs every live check from scratch.
+  Nothing from a prior run is reused as evidence. The write happens only if
+  every check still passes in this run.
+- After `WRITE_FAILED`, any later attempt needs a new command in a new run.
+  The skill itself never retries.
+
+Not authorisation: `AUTHORIZE WRITE 1901-003`, `AUTHORIZE SOURCE 1901-003`,
+`AUTHORIZE SOURCE WRITE` (no id), `AUTHORIZE SOURCE WRITE 1901-004` (wrong
+id), "Yes, authorize it", "Set it", "Proceed", "Do it".
+
 ## Input
 
-Exactly one `design_id`, for example `1901-003`. Trim surrounding whitespace
+Exactly one `design_id`, for example `1901-003`. In a step 2 run the id in
+the command is the target, unless the run was invoked for a specific design,
+in which case the command's id must match it. Trim surrounding whitespace
 from the user's input, and nothing else. Match by exact string equality: no
 case folding, no fuzzy match, no closest id, no normalising `1901-3` into
 `1901-003`. No usable single id: `NOT_FOUND` with a `human_action_required`
@@ -129,16 +179,15 @@ result and no write. Every check performed is recorded in `checks` as
    nothing overwritten, human review required. A different form of the same
    file (for example with `?usp=sharing`) is still a different value; say so
    in the check detail, but do not decide which wins.
-6. **Authorization.** Only now. Require an explicit statement in the current
-   conversation that authorises writing `render_source_path` for this design
-   id, such as "Yes, write the verified production source for 1901-003",
-   "Authorize the render_source_path update for 1901-003", or "Set the
-   resolved source for 1901-003". "Looks good", "proceed", "do it", or
-   "sounds good" are not sufficient without unmistakable context tying them
-   to this write for this id. Missing → `AWAITING_AUTHORIZATION`, with the
-   exact value that would be written named in `human_action_required` so the
-   user can authorise it knowingly. Record the authorisation quote or
-   paraphrase in `authorization.evidence`.
+6. **Authorization.** Only now, after every read-only check has passed in
+   this run. The current run's user message must be exactly
+   `AUTHORIZE SOURCE WRITE <design_id>` for this target id (Authorization
+   section). Ordinary source-write requests, vague confirmations, a command
+   for another id, and any authorization from an earlier run never count.
+   Missing → `AWAITING_AUTHORIZATION`, `write_performed = false`, with
+   `human_action_required` naming the exact canonical URL that would be
+   written and the exact command `AUTHORIZE SOURCE WRITE <design_id>`.
+   Present → record the command text verbatim in `authorization.evidence`.
 7. **Write.** One update request that sets the single cell
    `render_source_path` of the matched row to the canonical URL. Use the
    column letter read from the live header row and the matched row number.
@@ -214,9 +263,15 @@ Shape rules:
 
 - **"Set the source" with no id, or with the id only implied.** No write.
   Ask for the exact design id.
-- **"Proceed" after a report showing the resolved file.** Not authorisation
-  unless it unmistakably refers to writing `render_source_path` for that id.
-  Return `AWAITING_AUTHORIZATION` and name the exact value.
+- **"Set the production source for 1901-003."** That is a step 1 request.
+  Run the checks, propose the value, return `AWAITING_AUTHORIZATION`. It is
+  never authorisation, however clearly it names the design.
+- **"Proceed" or "Yes, authorize it" after a proposal.** Not the command.
+  `AWAITING_AUTHORIZATION` again, naming the exact command.
+- **The user authorised last turn, and this turn says "do it".** The command
+  was consumed by that run. `AWAITING_AUTHORIZATION`.
+- **`AUTHORIZE SOURCE WRITE 1901-004` arrives while 1901-003 is the target.**
+  Authorises nothing. Do not switch designs, do not write either one.
 - **`status` is `Approved` but `human_decision` is blank.** `HUMAN_APPROVAL_REQUIRED`.
 - **The user pastes a Drive URL and says write that.** It is checked against
   the resolved file; if it differs, `SOURCE_MISMATCH`. The user cannot
@@ -242,99 +297,9 @@ standard headers plus a blank-header column P holding `simple` and an unknown
 column X headed `wave`. Live output always carries what was actually read.
 `timestamp` is fixed in the fixtures.
 
-### 1. UPDATED
+### A. Proposal only: AWAITING_AUTHORIZATION
 
-Approved, resolved, file confirmed, cell blank, explicit authorisation.
-
-```json
-{
- "design_id": "1901-003",
- "result": "UPDATED",
- "write_performed": true,
- "timestamp": "2026-09-30T23:58:00Z",
- "source": {
-  "spreadsheet_id": "1UxnZsA9aWlxZHqMAt17_7HAe86w_cHcMik3xpXQrfq0",
-  "sheet_name": "Idea Queue",
-  "sheet_id": "1283408381",
-  "row_number": 4
- },
- "before": {
-  "render_source_path": ""
- },
- "after": {
-  "render_source_path": "https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view"
- },
- "verification": {
-  "human_decision": "APPROVE",
-  "source_resolution": "RESOLVED",
-  "source_file_id": "1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh",
-  "source_file_name": "1901-003-redraw-c-stamp.png",
-  "source_url": "https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view",
-  "post_write_verified": true
- },
- "authorization": {
-  "received": true,
-  "evidence": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
- },
- "checks": [
-  {
-   "check": "input",
-   "status": "PASS",
-   "detail": "design_id '1901-003' (trimmed)"
-  },
-  {
-   "check": "queue_read",
-   "status": "PASS",
-   "detail": "exactly one row (sheet row 4) carries id 1901-003"
-  },
-  {
-   "check": "unknown_columns",
-   "status": "INFO",
-   "detail": "preserved, not modified: P (header '') = 'simple'; X (header 'wave') = '2'"
-  },
-  {
-   "check": "human_approval",
-   "status": "PASS",
-   "detail": "human_decision is exactly APPROVE"
-  },
-  {
-   "check": "source_resolution",
-   "status": "PASS",
-   "detail": "RESOLVED: 1901-003-redraw-c-stamp.png (id 1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh, image/png)"
-  },
-  {
-   "check": "file_identity",
-   "status": "PASS",
-   "detail": "Drive file 1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh exists and matches; canonical URL https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view"
-  },
-  {
-   "check": "existing_value",
-   "status": "PASS",
-   "detail": "render_source_path is blank; eligible for write"
-  },
-  {
-   "check": "authorization",
-   "status": "PASS",
-   "detail": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
-  },
-  {
-   "check": "write",
-   "status": "PASS",
-   "detail": "one update request: 'Idea Queue'!S4 = https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view"
-  },
-  {
-   "check": "post_write_reread",
-   "status": "PASS",
-   "detail": "render_source_path equals the intended URL; human_decision, status, art_path, render_status, render_qa and every other field are unchanged"
-  }
- ],
- "human_action_required": null
-}
-```
-
-### 2. AWAITING_AUTHORIZATION
-
-Same design, every check passes, but nothing in the conversation authorises this write.
+Input: `Set the production source for 1901-003.` Every check passes and the cell is blank; the run proposes the value and the exact command, and writes nothing.
 
 ```json
 {
@@ -405,14 +370,264 @@ Same design, every check passes, but nothing in the conversation authorises this
   {
    "check": "authorization",
    "status": "FAIL",
-   "detail": "no explicit authorization for this specific render_source_path write in the current conversation"
+   "detail": "the current run does not contain the exact command AUTHORIZE SOURCE WRITE 1901-003; ordinary requests and vague confirmations never authorize a write"
   }
  ],
- "human_action_required": "To proceed, explicitly authorize writing render_source_path = https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view for 1901-003 (for example: \"Authorize the render_source_path update for 1901-003.\"). Nothing has been written."
+ "human_action_required": "No write performed. Row 4 is eligible: render_source_path would be set to https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view. To authorize exactly this write, send exactly: AUTHORIZE SOURCE WRITE 1901-003"
 }
 ```
 
-### 3. HUMAN_APPROVAL_REQUIRED
+### B. Authorised write: UPDATED
+
+Input: `AUTHORIZE SOURCE WRITE 1901-003`, in a new run. Every live check is re-run from scratch, one cell is written, the row is re-read.
+
+```json
+{
+ "design_id": "1901-003",
+ "result": "UPDATED",
+ "write_performed": true,
+ "timestamp": "2026-09-30T23:58:00Z",
+ "source": {
+  "spreadsheet_id": "1UxnZsA9aWlxZHqMAt17_7HAe86w_cHcMik3xpXQrfq0",
+  "sheet_name": "Idea Queue",
+  "sheet_id": "1283408381",
+  "row_number": 4
+ },
+ "before": {
+  "render_source_path": ""
+ },
+ "after": {
+  "render_source_path": "https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view"
+ },
+ "verification": {
+  "human_decision": "APPROVE",
+  "source_resolution": "RESOLVED",
+  "source_file_id": "1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh",
+  "source_file_name": "1901-003-redraw-c-stamp.png",
+  "source_url": "https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view",
+  "post_write_verified": true
+ },
+ "authorization": {
+  "received": true,
+  "evidence": "AUTHORIZE SOURCE WRITE 1901-003"
+ },
+ "checks": [
+  {
+   "check": "input",
+   "status": "PASS",
+   "detail": "design_id '1901-003' (trimmed)"
+  },
+  {
+   "check": "queue_read",
+   "status": "PASS",
+   "detail": "exactly one row (sheet row 4) carries id 1901-003"
+  },
+  {
+   "check": "unknown_columns",
+   "status": "INFO",
+   "detail": "preserved, not modified: P (header '') = 'simple'; X (header 'wave') = '2'"
+  },
+  {
+   "check": "human_approval",
+   "status": "PASS",
+   "detail": "human_decision is exactly APPROVE"
+  },
+  {
+   "check": "source_resolution",
+   "status": "PASS",
+   "detail": "RESOLVED: 1901-003-redraw-c-stamp.png (id 1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh, image/png)"
+  },
+  {
+   "check": "file_identity",
+   "status": "PASS",
+   "detail": "Drive file 1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh exists and matches; canonical URL https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view"
+  },
+  {
+   "check": "existing_value",
+   "status": "PASS",
+   "detail": "render_source_path is blank; eligible for write"
+  },
+  {
+   "check": "authorization",
+   "status": "PASS",
+   "detail": "current run contains the exact command: AUTHORIZE SOURCE WRITE 1901-003"
+  },
+  {
+   "check": "write",
+   "status": "PASS",
+   "detail": "one update request: 'Idea Queue'!S4 = https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view"
+  },
+  {
+   "check": "post_write_reread",
+   "status": "PASS",
+   "detail": "render_source_path equals the intended URL; human_decision, status, art_path, render_status, render_qa and every other field are unchanged"
+  }
+ ],
+ "human_action_required": null
+}
+```
+
+### C. Wrong design id: AWAITING_AUTHORIZATION
+
+Target `1901-003`; input `AUTHORIZE SOURCE WRITE 1901-004`. Not reinterpreted for either design; nothing written.
+
+```json
+{
+ "design_id": "1901-003",
+ "result": "AWAITING_AUTHORIZATION",
+ "write_performed": false,
+ "timestamp": "2026-09-30T23:58:00Z",
+ "source": {
+  "spreadsheet_id": "1UxnZsA9aWlxZHqMAt17_7HAe86w_cHcMik3xpXQrfq0",
+  "sheet_name": "Idea Queue",
+  "sheet_id": "1283408381",
+  "row_number": 4
+ },
+ "before": {
+  "render_source_path": ""
+ },
+ "after": {
+  "render_source_path": ""
+ },
+ "verification": {
+  "human_decision": "APPROVE",
+  "source_resolution": "RESOLVED",
+  "source_file_id": "1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh",
+  "source_file_name": "1901-003-redraw-c-stamp.png",
+  "source_url": "https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view",
+  "post_write_verified": false
+ },
+ "authorization": {
+  "received": false,
+  "evidence": ""
+ },
+ "checks": [
+  {
+   "check": "input",
+   "status": "PASS",
+   "detail": "design_id '1901-003' (trimmed)"
+  },
+  {
+   "check": "queue_read",
+   "status": "PASS",
+   "detail": "exactly one row (sheet row 4) carries id 1901-003"
+  },
+  {
+   "check": "unknown_columns",
+   "status": "INFO",
+   "detail": "preserved, not modified: P (header '') = 'simple'; X (header 'wave') = '2'"
+  },
+  {
+   "check": "human_approval",
+   "status": "PASS",
+   "detail": "human_decision is exactly APPROVE"
+  },
+  {
+   "check": "source_resolution",
+   "status": "PASS",
+   "detail": "RESOLVED: 1901-003-redraw-c-stamp.png (id 1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh, image/png)"
+  },
+  {
+   "check": "file_identity",
+   "status": "PASS",
+   "detail": "Drive file 1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh exists and matches; canonical URL https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view"
+  },
+  {
+   "check": "existing_value",
+   "status": "PASS",
+   "detail": "render_source_path is blank; eligible for write"
+  },
+  {
+   "check": "authorization",
+   "status": "FAIL",
+   "detail": "the command names 1901-004, not the target 1901-003; it authorizes nothing in this run"
+  }
+ ],
+ "human_action_required": "No write performed. Row 4 is eligible: render_source_path would be set to https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view. To authorize exactly this write, send exactly: AUTHORIZE SOURCE WRITE 1901-003"
+}
+```
+
+### D. Vague confirmation: AWAITING_AUTHORIZATION
+
+Input: `Proceed.` after the proposal in Example A.
+
+```json
+{
+ "design_id": "1901-003",
+ "result": "AWAITING_AUTHORIZATION",
+ "write_performed": false,
+ "timestamp": "2026-09-30T23:58:00Z",
+ "source": {
+  "spreadsheet_id": "1UxnZsA9aWlxZHqMAt17_7HAe86w_cHcMik3xpXQrfq0",
+  "sheet_name": "Idea Queue",
+  "sheet_id": "1283408381",
+  "row_number": 4
+ },
+ "before": {
+  "render_source_path": ""
+ },
+ "after": {
+  "render_source_path": ""
+ },
+ "verification": {
+  "human_decision": "APPROVE",
+  "source_resolution": "RESOLVED",
+  "source_file_id": "1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh",
+  "source_file_name": "1901-003-redraw-c-stamp.png",
+  "source_url": "https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view",
+  "post_write_verified": false
+ },
+ "authorization": {
+  "received": false,
+  "evidence": ""
+ },
+ "checks": [
+  {
+   "check": "input",
+   "status": "PASS",
+   "detail": "design_id '1901-003' (trimmed)"
+  },
+  {
+   "check": "queue_read",
+   "status": "PASS",
+   "detail": "exactly one row (sheet row 4) carries id 1901-003"
+  },
+  {
+   "check": "unknown_columns",
+   "status": "INFO",
+   "detail": "preserved, not modified: P (header '') = 'simple'; X (header 'wave') = '2'"
+  },
+  {
+   "check": "human_approval",
+   "status": "PASS",
+   "detail": "human_decision is exactly APPROVE"
+  },
+  {
+   "check": "source_resolution",
+   "status": "PASS",
+   "detail": "RESOLVED: 1901-003-redraw-c-stamp.png (id 1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh, image/png)"
+  },
+  {
+   "check": "file_identity",
+   "status": "PASS",
+   "detail": "Drive file 1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh exists and matches; canonical URL https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view"
+  },
+  {
+   "check": "existing_value",
+   "status": "PASS",
+   "detail": "render_source_path is blank; eligible for write"
+  },
+  {
+   "check": "authorization",
+   "status": "FAIL",
+   "detail": "the current run does not contain the exact command AUTHORIZE SOURCE WRITE 1901-003; ordinary requests and vague confirmations never authorize a write"
+  }
+ ],
+ "human_action_required": "No write performed. Row 4 is eligible: render_source_path would be set to https://drive.google.com/file/d/1R4GEuXOqzjUdjESKyEo8sGemAwV2ThIh/view. To authorize exactly this write, send exactly: AUTHORIZE SOURCE WRITE 1901-003"
+}
+```
+
+### E. HUMAN_APPROVAL_REQUIRED
 
 `human_decision` is blank. `REVISE` and `REJECT` end the same way.
 
@@ -444,7 +659,7 @@ Same design, every check passes, but nothing in the conversation authorises this
  },
  "authorization": {
   "received": true,
-  "evidence": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
+  "evidence": "AUTHORIZE SOURCE WRITE 1901-003"
  },
  "checks": [
   {
@@ -472,7 +687,7 @@ Same design, every check passes, but nothing in the conversation authorises this
 }
 ```
 
-### 4. SOURCE_NOT_RESOLVED
+### F. SOURCE_NOT_RESOLVED
 
 The resolver returned `AMBIGUOUS`.
 
@@ -504,7 +719,7 @@ The resolver returned `AMBIGUOUS`.
  },
  "authorization": {
   "received": true,
-  "evidence": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
+  "evidence": "AUTHORIZE SOURCE WRITE 1901-003"
  },
  "checks": [
   {
@@ -537,7 +752,7 @@ The resolver returned `AMBIGUOUS`.
 }
 ```
 
-### 5. SOURCE_ALREADY_SET_CONFLICT
+### G. SOURCE_ALREADY_SET_CONFLICT
 
 `render_source_path` already names a different file.
 
@@ -569,7 +784,7 @@ The resolver returned `AMBIGUOUS`.
  },
  "authorization": {
   "received": true,
-  "evidence": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
+  "evidence": "AUTHORIZE SOURCE WRITE 1901-003"
  },
  "checks": [
   {
@@ -612,7 +827,7 @@ The resolver returned `AMBIGUOUS`.
 }
 ```
 
-### 6. ALREADY_SET
+### H. ALREADY_SET
 
 `render_source_path` already equals the canonical URL.
 
@@ -644,7 +859,7 @@ The resolver returned `AMBIGUOUS`.
  },
  "authorization": {
   "received": true,
-  "evidence": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
+  "evidence": "AUTHORIZE SOURCE WRITE 1901-003"
  },
  "checks": [
   {
@@ -687,7 +902,7 @@ The resolver returned `AMBIGUOUS`.
 }
 ```
 
-### 7. WRITE_FAILED
+### I. WRITE_FAILED
 
 The update reported success but the re-read still shows a blank cell. One request, no retry.
 
@@ -719,7 +934,7 @@ The update reported success but the re-read still shows a blank cell. One reques
  },
  "authorization": {
   "received": true,
-  "evidence": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
+  "evidence": "AUTHORIZE SOURCE WRITE 1901-003"
  },
  "checks": [
   {
@@ -760,7 +975,7 @@ The update reported success but the re-read still shows a blank cell. One reques
   {
    "check": "authorization",
    "status": "PASS",
-   "detail": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
+   "detail": "current run contains the exact command: AUTHORIZE SOURCE WRITE 1901-003"
   },
   {
    "check": "write",
@@ -777,7 +992,7 @@ The update reported success but the re-read still shows a blank cell. One reques
 }
 ```
 
-### 8. DUPLICATE_ID
+### J. DUPLICATE_ID
 
 Two rows carry the id.
 
@@ -809,7 +1024,7 @@ Two rows carry the id.
  },
  "authorization": {
   "received": true,
-  "evidence": "User wrote \"Authorize the render_source_path update for 1901-003.\" in the current conversation, after seeing the resolved file."
+  "evidence": "AUTHORIZE SOURCE WRITE 1901-003"
  },
  "checks": [
   {
@@ -831,7 +1046,8 @@ Two rows carry the id.
 
 The skill worked if the reply is one JSON object in the shape above; at most
 one update request was issued in the run and it targeted only the
-`render_source_path` cell of the matched row; the value written is a full
-canonical Drive file URL; every `UPDATED` was confirmed by a re-read of the
-same row; no `WRITE_FAILED` was followed by a second request; and no Drive
+`render_source_path` cell of the matched row; that run's user message was
+exactly `AUTHORIZE SOURCE WRITE <design_id>` for that row's id; the value
+written is a full canonical Drive file URL; every `UPDATED` was confirmed by
+a re-read of the same row; no `WRITE_FAILED` was followed by a second request; and no Drive
 file, document, other cell, or external system changed during the run.
